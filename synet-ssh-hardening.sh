@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Synet SSH Hardening v1.2 — защита SSH на Ubuntu 22.04/24.04/26.04.
+# Synet SSH Hardening v1.3 — защита SSH на Ubuntu 22.04/24.04/26.04.
 # Использование: sudo bash synet-ssh-hardening.sh
-# After connecting on the new port as the new user, run:
+# После входа в новую SSH-сессию под новым пользователем на порту 22:
 #   sudo env SYNET_CONNECTED_PORT="${SSH_CONNECTION##* }" /usr/local/sbin/synet-ssh-guard --confirm
-# If not confirmed within 15 minutes, original SSH settings are restored.
+# Без подтверждения прежние настройки восстанавливаются через 15 минут.
 set -Eeuo pipefail
 umask 077
 
@@ -14,19 +14,6 @@ CONFIG=/etc/ssh/sshd_config.d/00-synet-ssh-hardening.conf
 ROLLBACK_UNIT=synet-ssh-guard-rollback
 TIMEOUT=15min
 OWN_PENDING=0
-SOCKET_DROPIN=/etc/systemd/system/ssh.socket.d/99-synet-ssh.conf
-
-configure_socket_ports() {
-  # When ssh.socket is active, its ListenStream entries can override sshd Port.
-  [[ "$SOCKET_ACTIVE" == 1 ]] || return 0
-  install -d -m 755 /etc/systemd/system/ssh.socket.d
-  {
-    printf '[Socket]\nListenStream=\n'
-    for port in "$@"; do printf 'ListenStream=%s\n' "$port"; done
-  } > "$SOCKET_DROPIN"
-  chmod 644 "$SOCKET_DROPIN"
-}
-
 say()  { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33mПРЕДУПРЕЖДЕНИЕ: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\nОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -46,19 +33,6 @@ restore_config() {
   else
     rm -f -- "$CONFIG"
   fi
-  if [[ -f "$STATE_DIR/previous-ssh-socket-dropin" ]]; then
-    install -d -m 755 /etc/systemd/system/ssh.socket.d
-    cp -a "$STATE_DIR/previous-ssh-socket-dropin" "$SOCKET_DROPIN"
-  else
-    rm -f "$SOCKET_DROPIN"
-  fi
-  if [[ "$UFW_ADDED" == 1 ]] && command -v ufw >/dev/null 2>&1; then
-    ufw --force delete allow "${NEW_PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-  systemctl daemon-reload || true
-  if [[ "$SOCKET_ACTIVE" == 1 ]]; then
-    systemctl restart ssh.socket || true
-  fi
   systemctl reload ssh.service 2>/dev/null || true
 }
 
@@ -77,35 +51,13 @@ rollback() {
 finish() {
   require_root
   load_state
-  [[ "${SYNET_CONNECTED_PORT:-}" == "$NEW_PORT" ]] || die \
-    "Подтвердите вход только из НОВОЙ SSH-сессии через порт $NEW_PORT, using: sudo env SYNET_CONNECTED_PORT=\"\${SSH_CONNECTION##* }\" $CONTROL --confirm"
-  say "Новая SSH-сессия подтверждена на порту $NEW_PORT. Закрываем старые SSH-порты."
-  # Keep only the designated SSH port in our snippet. The original sshd_config is untouched.
-  sed -i -E '/^Port [0-9]+$/d' "$CONFIG"
-  { printf 'Port %s\n' "$NEW_PORT"; cat "$CONFIG"; } > "$STATE_DIR/finished-config"
-  install -m 600 "$STATE_DIR/finished-config" "$CONFIG"
-  sshd -t || { restore_config; die 'Ошибка конфигурации SSH: прежние настройки восстановлены.'; }
-  configure_socket_ports "$NEW_PORT"
-  systemctl daemon-reload
-  if [[ "$SOCKET_ACTIVE" == 1 ]]; then systemctl restart ssh.socket; fi
-  systemctl reload ssh.service 2>/dev/null || true
-  if ! ss -Hlt "( sport = :$NEW_PORT )" | grep -q .; then
-    restore_config
-    die "New port $NEW_PORT не прослушивается: прежние настройки восстановлены."
-  fi
-  read -r -a PREVIOUS_PORTS <<< "$OLD_PORTS_JOINED"
-  for port in "${PREVIOUS_PORTS[@]}"; do
-    [[ "$port" == "$NEW_PORT" ]] && continue
-    if ss -Hlt "( sport = :$port )" | grep -q .; then
-      restore_config
-      die "Old port $port всё ещё прослушивается (возможно, конфликт с Port/ListenStream); прежние настройки восстановлены."
-    fi
-  done
+  [[ "${SYNET_CONNECTED_PORT:-}" == 22 && "${SUDO_USER:-}" == "$TARGET_USERNAME" ]] || die \
+    'Подтвердите только из НОВОГО SSH-подключения под указанным пользователем на порту 22.'
+  sshd -t || die 'Конфигурация SSH содержит ошибки. Подтверждение отменено.'
+  ss -Hlt '( sport = :22 )' | grep -q . || die 'SSH больше не слушает порт 22. Подтверждение отменено.'
   systemctl stop "${ROLLBACK_UNIT}.timer" 2>/dev/null || true
-  # Old firewall allow rules are intentionally left in place: deleting shared rules may break other services.
   rm -f "$STATE_FILE"
-  say "Защита SSH включена. Порт: $NEW_PORT. Вход root и вход по паролю отключены."
-  warn 'Старые разрешающие правила файрвола могут остаться. Проверьте UFW и файрвол провайдера, а также отсутствие SSH на старом порту.'
+  say 'Новый вход по SSH-ключу подтверждён. Защита активна, порт SSH остался 22.'
 }
 
 if [[ ${1:-} == '--rollback' ]]; then rollback; exit 0; fi
@@ -137,7 +89,7 @@ command -v systemd-run >/dev/null 2>&1 || die 'Для автоматическо
 
 say 'Synet — автоматическая защита SSH'
 printf 'Скрипт запросит имя пользователя, пароль для sudo и ОДИН публичный SSH-ключ.\n'
-printf 'Новый SSH-порт будет выбран автоматически. Старые порты временно сохраняются для отката.\n'
+printf 'SSH-порт останется 22. После настройки нужно проверить новый вход, иначе сработает откат.\n'
 read -r -p 'Имя пользователя (например, lendry): ' USERNAME
 [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Недопустимое имя: только строчные латинские буквы, цифры, _ и -.'
 [[ "$USERNAME" != root ]] || die 'Нельзя использовать root.'
@@ -154,31 +106,10 @@ ssh-keygen -lf "$TMP_KEY" >/dev/null 2>&1 || die 'Некорректный пу�
 
 # Safety checks before changing SSH configuration.
 sshd -t || die 'Текущая конфигурация sshd содержит ошибки. Изменения отменены.'
-if systemctl is-active --quiet ssh.socket; then
-  SOCKET_ACTIVE=1
-else
-  SOCKET_ACTIVE=0
-fi
-if [[ "$SOCKET_ACTIVE" == 1 ]] && grep -qsHE '^[[:space:]]*ListenStream[[:space:]]*=' \
-    /etc/systemd/system/ssh.socket.d/*.conf 2>/dev/null; then
-  die 'В ssh.socket есть пользовательский ListenStream. Автоматическая смена порта отменена.'
-fi
-
-# Collect effective ports. Current sshd_config is otherwise not edited.
-mapfile -t OLD_PORTS < <(sshd -T | awk '$1 == "port" {print $2}' | sort -nu)
-((${#OLD_PORTS[@]})) || OLD_PORTS=(22)
-# Include port 22 as an explicit emergency fallback only if it already listens.
-# Random high port must not be in use.
-NEW_PORT=${SYNET_SSH_PORT:-}
-if [[ -n "$NEW_PORT" ]]; then
-  [[ "$NEW_PORT" =~ ^[0-9]{4,5}$ ]] && (( NEW_PORT >= 1024 && NEW_PORT <= 65535 )) || die 'Недопустимое значение SYNET_SSH_PORT.'
-  ss -Hlt "( sport = :$NEW_PORT )" | grep -q . && die "Port $NEW_PORT уже занят."
-else
-  for _ in {1..30}; do
-    NEW_PORT=$(shuf -i 20000-49999 -n 1)
-    if ! ss -Hlt "( sport = :$NEW_PORT )" | grep -q .; then break; fi
-  done
-  ss -Hlt "( sport = :$NEW_PORT )" | grep -q . && die 'Не удалось найти свободный порт.'
+# Скрипт никогда не меняет SSH-порт и не трогает ssh.socket.
+NEW_PORT=22
+if ! ss -Hlt '( sport = :22 )' | grep -q .; then
+  die 'SSH не слушает порт 22. Из соображений безопасности скрипт не меняет текущий порт автоматически.'
 fi
 
 if ! id "$USERNAME" &>/dev/null; then
@@ -209,25 +140,10 @@ if [[ -e "$CONFIG" ]]; then
   HAD_CONFIG=1
   cp -a "$CONFIG" "$STATE_DIR/previous-config"
 fi
-if [[ -e /etc/systemd/system/ssh.socket.d/99-synet-ssh.conf ]]; then
-  cp -a /etc/systemd/system/ssh.socket.d/99-synet-ssh.conf "$STATE_DIR/previous-ssh-socket-dropin"
-fi
-UFW_ADDED=0
-# If UFW is active, ensure it permits the new port BEFORE we reconfigure sshd.
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-  if ! ufw status | grep -Eq "^${NEW_PORT}/tcp[[:space:]]+ALLOW"; then
-    ufw allow "${NEW_PORT}/tcp" comment 'synet-ssh-new-port'
-    UFW_ADDED=1
-  fi
-fi
-
 # Record safe root-written values for eventual rollback. No password or key is saved here.
 {
-  printf 'NEW_PORT=%q\n' "$NEW_PORT"
-  printf 'SOCKET_ACTIVE=%q\n' "$SOCKET_ACTIVE"
   printf 'HAD_CONFIG=%q\n' "$HAD_CONFIG"
-  printf 'UFW_ADDED=%q\n' "$UFW_ADDED"
-  printf 'OLD_PORTS_JOINED=%q\n' "${OLD_PORTS[*]}"
+  printf 'TARGET_USERNAME=%q\n' "$USERNAME"
 } > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 OWN_PENDING=1
@@ -237,11 +153,9 @@ OWN_PENDING=1
 [[ -f "$0" && -r "$0" ]] || die 'Запускайте скачанный файл, а не команду через конвейер curl | bash.'
 install -m 700 -- "$(readlink -f "$0")" "$CONTROL"
 
-# Safe first phase: keep the previous effective SSH ports until a new SSH login is verified.
+# Изменяем только правила авторизации SSH. Порт и ssh.socket остаются без изменений.
 {
-  printf '# Managed by Synet SSH Hardening. Do not edit before confirmation.\n'
-  for p in "${OLD_PORTS[@]}"; do printf 'Port %s\n' "$p"; done
-  printf 'Port %s\n' "$NEW_PORT"
+  printf '# Synet SSH Hardening: только правила входа, порт 22 не меняется.\n'
   printf '%s\n' \
     'PermitRootLogin no' \
     'DenyUsers root' \
@@ -254,7 +168,6 @@ install -m 700 -- "$(readlink -f "$0")" "$CONTROL"
     'LoginGraceTime 30'
 } > "$CONFIG"
 chmod 600 "$CONFIG"
-configure_socket_ports "${OLD_PORTS[@]}" "$NEW_PORT"
 
 if ! sshd -t; then
   restore_config
@@ -279,31 +192,23 @@ if ! systemd-run --collect --unit="$ROLLBACK_UNIT" --on-active="$TIMEOUT" \
   die 'Не удалось запланировать откат. Настройки SSH восстановлены.'
 fi
 
-systemctl daemon-reload
-if [[ "$SOCKET_ACTIVE" == 1 ]]; then
-  if ! systemctl restart ssh.socket; then
-    restore_config
-    die 'Не удалось перезапустить ssh.socket. Прежние настройки восстановлены.'
-  fi
-fi
 if ! systemctl reload ssh.service 2>/dev/null; then
-  systemctl try-restart ssh.service >/dev/null 2>&1 || true
-fi
-if ! ss -Hlt "( sport = :$NEW_PORT )" | grep -q .; then
   restore_config
-  die "Новый SSH-порт $NEW_PORT не прослушивается. Прежняя конфигурация восстановлена."
+  die 'Не удалось применить настройки SSH. Прежние настройки восстановлены.'
+fi
+if ! ss -Hlt '( sport = :22 )' | grep -q .; then
+  restore_config
+  die 'Порт 22 перестал прослушиваться. Прежняя конфигурация восстановлена.'
 fi
 
 say 'Временная защищённая конфигурация SSH создана.'
-printf 'Новый пользователь: %s\n' "$USERNAME"
-printf 'Новый SSH-порт: %s\n' "$NEW_PORT"
-printf 'Старые SSH-порты временно оставлены открытыми: %s\n' "${OLD_PORTS[*]}"
+printf 'Пользователь: %s\n' "$USERNAME"
+printf 'Порт SSH: 22 (не изменён)\n'
 printf 'Вход root: запрещён\nВход по SSH-паролю: запрещён\nВход по публичному ключу: включён\n'
-warn 'Если у VPS-провайдера есть внешний файрвол, откройте в нём НОВЫЙ TCP-порт до проверки.'
 printf '\n1) НЕ ЗАКРЫВАЙТЕ текущую SSH-сессию.\n'
-printf '2) Откройте ВТОРОЙ терминал и войдите со СВОИМ ПРИВАТНЫМ ключом (не публичным):\n'
-printf '   ssh -p %s -i /путь/к/приватному_ключу %s@IP_СЕРВЕРА\n' "$NEW_PORT" "$USERNAME"
-printf '3) В НОВОЙ SSH-сессии выполните СТРОГО эту команду:\n'
+printf '2) Откройте ВТОРОЙ терминал и войдите под настроенным пользователем со своим ПРИВАТНЫМ ключом:\n'
+printf '   ssh -p 22 -i /путь/к/приватному_ключу %s@IP_СЕРВЕРА\n' "$USERNAME"
+printf '3) После успешного входа выполните в НОВОЙ SSH-сессии:\n'
 printf '   sudo env SYNET_CONNECTED_PORT="${SSH_CONNECTION##* }" %s --confirm\n' "$CONTROL"
 printf '\nЕсли за 15 минут не подтвердить вход, прежние настройки SSH восстановятся автоматически.\n'
 printf 'Перезагрузка не нужна.\n'
